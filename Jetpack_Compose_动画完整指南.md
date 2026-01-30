@@ -655,6 +655,50 @@ if (visible) {
 }
 ```
 
+**Recompose的完整机制：**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  1. 状态变化（State Mutation）                                │
+│     - mutableStateOf创建的State对象                          │
+│     - 调用 .value 修改值                                     │
+└────────────────────┬─────────────────────────────────────────┘
+                     │
+                     ↓
+┌──────────────────────────────────────────────────────────────┐
+│  2. Snapshot系统捕获变化                                       │
+│     - 在MutableSnapshot中执行写入                             │
+│     - 记录所有被修改的State对象                               │
+│     - 计算最小需要Recompose的范围（Scope）                   │
+└────────────────────┬─────────────────────────────────────────┘
+                     │
+                     ↓
+┌──────────────────────────────────────────────────────────────┐
+│  3. Composition调度                                           │
+│     - 将Recompose任务提交到调度队列                           │
+│     - 确定哪些Composable需要重新执行                          │
+│     - 按照依赖关系排序                                       │
+└────────────────────┬─────────────────────────────────────────┘
+                     │
+                     ↓
+┌──────────────────────────────────────────────────────────────┐
+│  4. 执行Recompose                                             │
+│     - 调用标记为需要Recompose的Composable函数                 │
+│     - 函数执行过程中：                                        │
+│       a. 执行remember：检查是否有缓存值                       │
+│       b. 读取State：记录新的依赖关系                          │
+│       c. 调用子Composable：构建新的UI树                       │
+│     - 比新旧UI树的差异（Diff）                               │
+└────────────────────┬─────────────────────────────────────────┘
+                     │
+                     ↓
+┌──────────────────────────────────────────────────────────────┐
+│  5. Layout和Draw                                              │
+│     - 如果Layout结果变化，触发Layout阶段                      │
+│     - 执行Draw阶段，绘制到Canvas                             │
+└──────────────────────────────────────────────────────────────┘
+```
+
 **动画值变化如何触发Recompose：**
 
 ```kotlin
@@ -667,23 +711,100 @@ fun animateFloatAsState(
     val animatable = remember { Animatable(targetValue) }
     
     LaunchedEffect(targetValue) {
+        // targetValue变化时启动新动画
         animatable.animateTo(targetValue, animationSpec)
     }
     
+    // 返回State对象，每帧更新都会触发Recompose
     return animatable.asState()
+}
+
+// Animatable.asState()内部
+class Animatable<T> {
+    private val _value = mutableStateOf(initialValue)
+    
+    val value: T by _value  // State类型
+    
+    suspend fun animateTo(target: T, spec: AnimationSpec<T>) {
+        while (!finished) {
+            val newValue = calculateValue()
+            _value.value = newValue  // 更新State，触发Recompose
+            delayFrame()
+        }
+    }
 }
 ```
 
-**关键点：**
-1. `Animatable`的值是`State<Float>`类型
-2. 每帧更新时，`State.value`改变
-3. `State`被读取的地方会标记为需要Recompose
-4. Compose调度器执行Recompose
+**关键点详解：**
 
-**Recompose优化：**
-- Compose会跳过未变化的子树
-- 使用`remember`避免不必要的重建
-- 使用`derivedStateOf`缓存计算结果
+1. **State的可观察性**
+   - `mutableStateOf`创建的对象是可观察的
+   - Compose通过Snapshot系统追踪State的变化
+   - State变化会自动通知订阅者
+
+2. **依赖追踪**
+   - Recompose时，Compose记录每个Composable读取了哪些State
+   - 只有被读取的State变化时，才会触发Recompose
+   - 未被读取的State变化不会触发Recompose
+
+3. **智能跳过（Smart Recomposition）**
+   - Compose会比较新旧Composable的参数
+   - 如果参数未变化，跳过该Composable的Recompose
+   - 使用`stable`注解的类更容易被优化
+
+4. **动画与Recombine的关系**
+   - 动画每帧更新State值
+   - 每次State更新都会触发Recompose
+   - 但Compose会跳过未变化的部分
+   - 使用`graphicsLayer`可以避免Recompose
+
+**Recompose优化策略：**
+
+```kotlin
+// ❌ 优化前：整个Box每帧都Recompose
+@Composable
+fun BeforeOptimization() {
+    var progress by remember { mutableStateOf(0f) }
+    
+    LaunchedEffect(Unit) {
+        progress = 1f  // 触发Recompose
+    }
+    
+    Box {
+        // 这个Text不需要Recompose，但也会被重建
+        Text("Static Text")
+        // 这个Image每帧都Recompose
+        Image(modifier = Modifier.scale(progress))
+    }
+}
+
+// ✅ 优化后：使用graphicsLayer避免Recompose
+@Composable
+fun AfterOptimization() {
+    var progress by remember { mutableStateOf(0f) }
+    
+    LaunchedEffect(Unit) {
+        progress = 1f
+    }
+    
+    Box {
+        // Text不会Recompose，因为它没读取progress
+        Text("Static Text")
+        // Image使用graphicsLayer，不触发Recompose
+        Image(modifier = Modifier.graphicsLayer { scaleX = progress; scaleY = progress })
+    }
+}
+```
+
+**Recompose优化技巧：**
+
+| 优化技巧 | 适用场景 | 效果 |
+|---------|---------|------|
+| `remember` | 缓存计算结果 | 避免重复计算 |
+| `derivedStateOf` | 依赖多个State的组合 | 减少Recompose次数 |
+| `stable` 标记 | 自定义数据类 | 提高跳过Recompose的概率 |
+| `graphicsLayer` | 绘制动画 | 完全避免Recompose |
+| `key` | 列表项动画 | 精确控制Recompose范围 |
 
 ### 7.3 Snapshot系统
 
@@ -692,62 +813,389 @@ fun animateFloatAsState(
 - 实现可观察性（Observable）
 - 支持原子性状态更新
 
+**Snapshot的核心思想：**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Snapshot系统架构                                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────┐                                            │
+│  │ Snapshot 1  │ ← 读取：viewState                          │
+│  │ (ReadOnly)  │   写入：无                                 │
+│  └─────────────┘                                            │
+│         ↓                                                   │
+│  ┌─────────────┐                                            │
+│  │ Snapshot 2  │ ← 读取：viewState, progressState          │
+│  │ (ReadOnly)  │   写入：无                                 │
+│  └─────────────┘                                            │
+│         ↓                                                   │
+│  ┌─────────────┐                                            │
+│  │ Snapshot 3  │ ← 读取：viewState                         │
+│  │ (Mutable)   │   写入：progressState = 0.5f              │
+│  └─────────────┘                                            │
+│         ↓                                                   │
+│  ┌─────────────┐                                            │
+│  │ Snapshot 4  │ ← 读取：viewState                         │
+│  │ (ReadOnly)  │   写入：无                                 │
+│  └─────────────┘                                            │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Snapshot系统的工作原理：**
+
+```
+1. State对象创建
+   ┌────────────────────────────────────┐
+   │ val state = mutableStateOf(0f)      │
+   │                                    │
+   │ 内部：                            │
+   │ - StateRecord存储实际值            │
+   │ - 每个Snapshot有自己的StateRecord  │
+   │ - 通过SnapshotId索引               │
+   └────────────────────────────────────┘
+
+2. 读取State
+   ┌────────────────────────────────────┐
+   │ val value = state.value            │
+   │                                    │
+   │ 流程：                            │
+   │ - 获取当前SnapshotId              │
+   │ - 查找对应的StateRecord           │
+   │ - 返回值                          │
+   │ - 记录依赖（用于Recompose）       │
+   └────────────────────────────────────┘
+
+3. 写入State
+   ┌────────────────────────────────────┐
+   │ state.value = 1f                   │
+   │                                    │
+   │ 流程：                            │
+   │ - 在当前Snapshot中创建新的Record   │
+   │ - 设置新值                        │
+   │ - 标记该State为"已修改"           │
+   └────────────────────────────────────┘
+
+4. Snapshot提交
+   ┌────────────────────────────────────┐
+   │ snapshot.apply()                   │
+   │                                    │
+   │ 流程：                            │
+   │ - 找到所有被修改的State            │
+   │ - 将新Record设为当前值             │
+   │ - 通知观察者（触发Recompose）     │
+   └────────────────────────────────────┘
+```
+
 **动画中的Snapshot：**
 
 ```kotlin
 // 动画每一帧都在新的Snapshot中更新
-while (true) {
-    val currentTime = frameTimeNanos
-    val value = calculateValue(currentTime)
+suspend fun animateTo(
+    targetValue: T,
+    animationSpec: AnimationSpec<T>
+) {
+    // 启动动画协程
+    val startTime = withFrameNanos { it }
+    var playTime = 0L
     
-    // 在Snapshot中更新状态
-    Snapshot.withMutableSnapshot {
-        animatable.updateState(value)
+    while (!isFinished) {
+        // 计算当前帧的值
+        val value = animationSpec.getValue(
+            playTime = playTime,
+            initialValue = initialValue,
+            targetValue = targetValue
+        )
+        
+        // 在Snapshot中更新状态
+        Snapshot.withMutableSnapshot {
+            this@Animatable.internalState.value = value
+        }
+        
+        // 等待下一帧
+        val frameTime = withFrameNanos { it }
+        playTime = frameTime - startTime
     }
-    
-    // 触发Recompose
-    composeScheduler.scheduleFrame()
 }
 ```
 
-**Snapshot关键概念：**
-- `MutableSnapshot` - 可变快照，用于写入
-- `Snapshot.withMutableSnapshot` - 在快照中执行操作
-- `apply()` - 提交快照，触发监听器
+**Snapshot关键概念详解：**
+
+1. **Snapshot类型**
+   - `Snapshot` - 只读快照，用于读取状态
+   - `MutableSnapshot` - 可变快照，用于修改状态
+   - `GlobalSnapshot` - 全局快照，用于UI线程
+
+2. **Snapshot操作**
+   - `Snapshot.takeMutableSnapshot()` - 创建可变快照
+   - `Snapshot.withMutableSnapshot()` - 在快照中执行操作
+   - `MutableSnapshot.apply()` - 提交快照
+   - `MutableSnapshot.dispose()` - 放弃快照
+
+3. **StateRecord机制**
+   ```kotlin
+   // 内部实现（简化版）
+   internal class StateObject<T> {
+       var firstStateRecord: StateRecord<T> = StateRecord(initialValue)
+       
+       fun get(snapshotId: Int): T {
+           var current = firstStateRecord
+           while (current.snapshotId > snapshotId) {
+               current = current.next ?: current
+           }
+           return current.value
+       }
+       
+       fun set(value: T, snapshot: MutableSnapshot) {
+           val record = snapshot.newRecord {
+               StateRecord(value)
+           }
+           firstStateRecord = record
+       }
+   }
+   ```
+
+4. **Snapshot的通知机制**
+   ```kotlin
+   // State内部注册观察者
+   val observer = object : StateObserver {
+       override fun onCommit() {
+           // Snapshot提交时调用
+           recomposer.scheduleRecompose()
+       }
+   }
+   
+   // 在Snapshot中注册
+   snapshot.registerApplyObserver(observer)
+   ```
+
+**Snapshot系统的优势：**
+
+| 特性 | 说明 | 优势 |
+|------|------|------|
+| **一致性** | 同一个Snapshot内读取状态是一致的 | 避免中间状态 |
+| **可撤销** | 未提交的Snapshot可以丢弃 | 支持动画取消 |
+| **原子性** | 所有修改要么全部生效，要么全部失效 | 避免部分更新 |
+| **性能优化** | Copy-on-Write机制，未修改的状态共享 | 减少内存分配 |
 
 ### 7.4 AnimationFrameClock
 
 **作用：** 控制动画帧的调度，与VSync同步
 
-**工作流程：**
+**VSync（垂直同步）简介：**
+- 显示器以固定频率刷新（通常是60Hz，约16.67ms一帧）
+- VSync信号是显示器的同步信号
+- 动画需要在VSync间隔内完成渲染，避免掉帧
+
+**工作流程详解：**
+
 ```
-1. 动画开始
-   ↓
-2. 注册AnimationFrameClock
-   ↓
-3. 等待VSync信号（约16.67ms）
-   ↓
-4. onAnimationFrame(timeMillis) 回调
-   ↓
-5. 计算当前帧的动画值
-   ↓
-6. 更新State，触发Recompose
-   ↓
-7. 循环回到步骤3
+┌─────────────────────────────────────────────────────────────┐
+│  AnimationFrameClock 工作流程                                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. 动画启动                                                  │
+│     - 调用 LaunchedEffect 启动协程                            │
+│     - 调用 withFrameNanos 开始第一帧                          │
+│                                                             │
+│     ↓                                                         │
+│                                                             │
+│  2. 注册 Choreographer                                       │
+│     - Android平台使用 Choreographer.getInstance()          │
+│     - 注册 postFrameCallback                                 │
+│     - 等待 VSync 信号                                        │
+│                                                             │
+│     ↓                                                         │
+│                                                             │
+│  3. VSync 信号到达                                           │
+│     - Choreographer 触发回调                                │
+│     - 传入当前帧的 nanoTime                                  │
+│     - 约每 16.67ms 触发一次                                  │
+│                                                             │
+│     ↓                                                         │
+│                                                             │
+│  4. 执行动画帧计算                                            │
+│     - 根据时间计算当前动画值                                  │
+│     - 更新 State 对象                                       │
+│     - Snapshot 提交                                         │
+│                                                             │
+│     ↓                                                         │
+│                                                             │
+│  5. 触发 Recompose                                           │
+│     - Snapshot 通知观察者                                   │
+│     - Recomposer 调度任务                                    │
+│     - 执行 Composition → Layout → Draw                      │
+│                                                             │
+│     ↓                                                         │
+│                                                             │
+│  6. 提交给 GPU 渲染                                          │
+│     - Canvas 绘制完成                                       │
+│     - SurfaceFlinger 合成                                    │
+│     - 显示到屏幕                                             │
+│                                                             │
+│     ↓                                                         │
+│                                                             │
+│  7. 循环：注册下一帧回调                                      │
+│     - 如果动画未完成，注册下一个回调                          │
+│     - 回到步骤 2                                             │
+│     - 如果动画完成，结束协程                                  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 **接口定义：**
 ```kotlin
 interface AnimationFrameClock {
+    /**
+     * 在下一帧执行操作
+     * @param onFrame 接收帧时间纳秒数的回调
+     * @return 回调的返回值
+     */
     suspend fun <R> withFrameNanos(
         onFrame: (frameTimeNanos: Long) -> R
     ): R
+    
+    /**
+     * 在下一帧执行操作（毫秒版本）
+     */
+    suspend fun <R> withFrameMillis(
+        onFrame: (frameTimeMillis: Long) -> R
+    ): R = withFrameNanos { onFrame(it / 1_000_000) }
 }
 ```
 
-**实现：**
-- Android平台使用`Choreographer`
-- 其他平台有各自的实现
+**Android平台实现：**
+```kotlin
+internal class AndroidAnimationFrameClock(
+    private val choreographer: Choreographer = Choreographer.getInstance()
+) : AnimationFrameClock {
+    
+    override suspend fun <R> withFrameNanos(
+        onFrame: (frameTimeNanos: Long) -> R
+    ): R = suspendCancellableCoroutine { continuation ->
+        
+        val callback = Choreographer.FrameCallback { frameTimeNanos ->
+            try {
+                val result = onFrame(frameTimeNanos)
+                continuation.resume(result)
+            } catch (e: Exception) {
+                continuation.resumeWithException(e)
+            }
+        }
+        
+        // 注册到 Choreographer
+        choreographer.postFrameCallback(callback)
+        
+        // 如果协程被取消，移除回调
+        continuation.invokeOnCancellation {
+            choreographer.removeFrameCallback(callback)
+        }
+    }
+}
+```
+
+**使用示例：**
+```kotlin
+// 自定义动画循环
+suspend fun customAnimation() {
+    val startTime = withFrameNanos { it }
+    var playTime = 0L
+    
+    while (playTime < 1_000_000_000L) { // 运行1秒
+        // 计算当前进度
+        val progress = playTime.toFloat() / 1_000_000_000f
+        
+        // 更新动画值
+        animatedValue = calculateValue(progress)
+        
+        // 等待下一帧
+        val currentTime = withFrameNanos { it }
+        playTime = currentTime - startTime
+    }
+}
+```
+
+**帧时间计算：**
+```kotlin
+// 计算动画播放时长
+suspend fun animateWithDuration(
+    durationMs: Long,
+    onUpdate: (progress: Float) -> Unit
+) {
+    val startTime = withFrameNanos { it }
+    val durationNanos = durationMs * 1_000_000L
+    
+    do {
+        val currentTime = withFrameNanos { it }
+        val playTime = (currentTime - startTime).coerceIn(0, durationNanos)
+        val progress = playTime.toFloat() / durationNanos.toFloat()
+        
+        onUpdate(progress)
+        
+        // 如果动画未完成，继续
+    } while (playTime < durationNanos)
+}
+```
+
+**AnimationFrameClock 在 Compose 中的应用：**
+
+1. **默认提供：**
+   - Compose 运行时自动提供 AnimationFrameClock
+   - 通过 `LocalAnimationClock` 获取
+   - 协程可以直接使用 `withFrameNanos`
+
+2. **自动取消：**
+   - Composable 销毁时，协程自动取消
+   - `withFrameNanos` 会清理 Choreographer 回调
+   - 避免内存泄漏
+
+3. **平台无关：**
+   - 桌面平台使用 AWT/Swing 定时器
+   - Web 平台使用 requestAnimationFrame
+   - 统一接口，跨平台兼容
+
+**帧率优化：**
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 掉帧 | 计算或绘制太慢 | 使用 `graphicsLayer` 优化 |
+| 帧率过高 | 不必要的动画 | 限制动画时长 |
+| 不同步 | 未使用 withFrameNanos | 始终使用帧回调 |
+| 内存泄漏 | 回调未取消 | 使用 suspendCancellableCoroutine |
+
+**性能监控：**
+```kotlin
+suspend fun animateWithMetrics(
+    durationMs: Long,
+    onUpdate: (progress: Float) -> Unit
+) {
+    val startTime = withFrameNanos { it }
+    var frameCount = 0
+    var lastFrameTime = startTime
+    
+    while (true) {
+        val currentTime = withFrameNanos { it }
+        frameCount++
+        
+        // 计算帧间隔
+        val frameInterval = currentTime - lastFrameTime
+        lastFrameTime = currentTime
+        
+        // 计算FPS
+        val fps = 1_000_000_000f / frameInterval
+        
+        // 执行更新
+        val playTime = (currentTime - startTime) / 1_000_000L
+        val progress = (playTime.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+        onUpdate(progress)
+        
+        if (progress >= 1f) break
+    }
+    
+    Log.d("Animation", "Frame count: $frameCount, Average FPS: ${frameCount / (durationMs / 1000f)}")
+}
+```
 
 ### 7.5 Coroutines在动画中的应用
 
@@ -756,6 +1204,337 @@ interface AnimationFrameClock {
 - 每帧之间需要等待VSync
 - 需要支持取消、暂停
 - 协程的suspend机制非常适合
+
+**协程在动画中的优势：**
+
+| 传统回调方式 | 协程方式 | 优势 |
+|------------|---------|------|
+| 回调地狱 | 线性代码 | 代码更易读 |
+| 手动管理状态 | 自动管理 | 减少错误 |
+| 难以取消 | 结构化并发 | 自动取消 |
+| 难以组合 | 可组合 | 灵活性高 |
+| 顺序混乱 | 顺序清晰 | 易于理解 |
+
+**协程动画的基本模式：**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  协程动画执行流程                                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  @Composable                                                 │
+│  fun AnimationExample() {                                   │
+│      var state by remember { mutableStateOf(false) }         │
+│                                                             │
+│      // 1. LaunchedEffect 启动协程                           │
+│      LaunchedEffect(state) {                                │
+│          // 2. 挂起点：开始动画                              │
+│          animatable.animateTo(1f)  ← suspend 函数           │
+│                                                             │
+│          // 3. 挂起点：等待下一帧                            │
+│          delay(100)                ← suspend 函数           │
+│                                                             │
+│          // 4. 继续执行动画                                  │
+│          animatable.animateTo(0f)  ← suspend 函数           │
+│                                                             │
+│          // 5. 动画完成或取消                                │
+│      }                                                       │
+│  }                                                           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**suspend动画函数详解：**
+
+```kotlin
+// 1. 基础的suspend动画函数
+suspend fun Animatable<Float>.animateTo(
+    targetValue: Float,
+    animationSpec: AnimationSpec<Float> = spring()
+): AnimationResult<Float> {
+    // 检查是否已经取消
+    ensureActive()
+    
+    // 创建动画运行器
+    val anim = animationSpec.vectorize(
+        TwoWayConverter(
+            { AnimationVector1D(it) },
+            { it.value }
+        )
+    )
+    
+    // 动画循环
+    while (!isFinished) {
+        // 检查取消
+        ensureActive()
+        
+        // 计算当前帧的值
+        val value = anim.getValue(
+            playTime = playTimeNanos,
+            initialValue = this.value,
+            targetValue = targetValue
+        )
+        
+        // 更新内部状态（会触发Recompose）
+        this.internalState.value = value
+        
+        // 挂起点：等待下一帧
+        withFrameNanos { frameTimeNanos ->
+            playTimeNanos = frameTimeNanos - startTime
+        }
+    }
+    
+    return AnimationResult(endState, endReason)
+}
+
+// 2. LaunchedEffect 的作用
+@Composable
+fun LaunchedEffect(
+    key1: Any?,
+    block: suspend CoroutineScope.() -> Unit
+) {
+    val currentComposer = currentComposer
+    remember(key1) {
+        // 创建协程
+        val scope = rememberCoroutineScope()
+        scope.launch {
+            try {
+                block()
+            } finally {
+                // 协程取消时的清理
+            }
+        }
+    }
+}
+```
+
+**协程的生命周期管理：**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Composable 生命周期与协程                                    │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. Composition 阶段                                          │
+│     ├─ Composable 函数执行                                   │
+│     ├─ remember 创建协程                                     │
+│     └─ LaunchedEffect 启动协程                               │
+│                                                             │
+│  2. Recompose 阶段                                            │
+│     ├─ 如果 key 未变化，协程继续运行                          │
+│     ├─ 如果 key 变化，旧协程取消                              │
+│     └─ 启动新协程                                            │
+│                                                             │
+│  3. Disposal 阶段                                            │
+│     ├─ Composable 从树中移除                                 │
+│     ├─ LaunchedEffect 自动取消协程                           │
+│     └─ 清理资源                                             │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**协程取消机制：**
+
+```kotlin
+// 协程取消的触发方式
+@Composable
+fun CancellationExample() {
+    var enabled by remember { mutableStateOf(true) }
+    
+    LaunchedEffect(enabled) {
+        // enabled 变化时，旧协程自动取消
+        animatable.animateTo(if (enabled) 1f else 0f)
+    }
+    
+    // 手动取消
+    val scope = rememberCoroutineScope()
+    Button(onClick = {
+        scope.coroutineContext.cancelChildren()
+    }) {
+        Text("Cancel")
+    }
+}
+```
+
+**协程动画的常见模式：**
+
+1. **顺序动画：**
+```kotlin
+LaunchedEffect(Unit) {
+    // 先播放第一个动画
+    animatable1.animateTo(1f)
+    // 再播放第二个动画
+    animatable2.animateTo(1f)
+    // 最后播放第三个动画
+    animatable3.animateTo(1f)
+}
+```
+
+2. **并行动画：**
+```kotlin
+LaunchedEffect(Unit) {
+    // 使用 async 启动多个并行动画
+    val job1 = async { animatable1.animateTo(1f) }
+    val job2 = async { animatable2.animateTo(1f) }
+    val job3 = async { animatable3.animateTo(1f) }
+    
+    // 等待所有动画完成
+    job1.await()
+    job2.await()
+    job3.await()
+}
+```
+
+3. **延迟动画：**
+```kotlin
+LaunchedEffect(Unit) {
+    animatable1.animateTo(1f)
+    delay(500)  // 延迟500ms
+    animatable2.animateTo(1f)
+}
+```
+
+4. **条件动画：**
+```kotlin
+LaunchedEffect(shouldAnimate) {
+    if (shouldAnimate) {
+        animatable.animateTo(1f)
+    } else {
+        animatable.snapTo(0f)
+    }
+}
+```
+
+5. **无限循环动画：**
+```kotlin
+LaunchedEffect(Unit) {
+    while (isActive) {  // isActive 检查协程是否活跃
+        animatable.animateTo(1f)
+        animatable.animateTo(0f)
+    }
+}
+```
+
+**协程动画的高级用法：**
+
+1. **可暂停的动画：**
+```kotlin
+@Composable
+fun PausableAnimation() {
+    var paused by remember { mutableStateOf(false) }
+    var progress by remember { mutableStateOf(0f) }
+    
+    LaunchedEffect(paused) {
+        val animatable = Animatable(0f)
+        
+        while (animatable.value < 1f) {
+            if (!paused) {
+                animatable.animateTo(
+                    targetValue = 1f,
+                    animationSpec = tween(durationMillis = 2000)
+                )
+            } else {
+                delay(100)  // 暂停时延迟
+            }
+            progress = animatable.value
+        }
+    }
+}
+```
+
+2. **可取消的动画：**
+```kotlin
+@Composable
+fun CancellableAnimation() {
+    val scope = rememberCoroutineScope()
+    val animatable = remember { Animatable(0f) }
+    
+    Button(onClick = {
+        // 启动动画
+        scope.launch {
+            animatable.animateTo(1f)
+        }
+    }) {
+        Text("Start")
+    }
+    
+    Button(onClick = {
+        // 取消动画
+        animatable.stop()
+    }) {
+        Text("Stop")
+    }
+}
+```
+
+3. **可逆转的动画：**
+```kotlin
+@Composable
+fun ReversibleAnimation() {
+    var direction by remember { mutableStateOf(1) }
+    val animatable = remember { Animatable(0f) }
+    
+    LaunchedEffect(direction) {
+        animatable.animateTo(
+            targetValue = if (direction == 1) 1f else 0f
+        )
+    }
+    
+    Button(onClick = {
+        direction *= -1  // 反转方向
+    }) {
+        Text("Reverse")
+    }
+}
+```
+
+**协程动画的错误处理：**
+
+```kotlin
+LaunchedEffect(Unit) {
+    try {
+        animatable.animateTo(1f)
+    } catch (e: CancellationException) {
+        // 协程被取消，正常情况
+        // 不需要处理
+    } catch (e: Exception) {
+        // 其他异常，需要处理
+        Log.e("Animation", "Animation failed", e)
+    } finally {
+        // 清理资源
+        cleanupResources()
+    }
+}
+```
+
+**协程动画的性能考虑：**
+
+1. **避免过多的协程：**
+   - 每个LaunchedEffect创建一个协程
+   - 过多协程会增加调度开销
+   - 合并可以合并的动画
+
+2. **使用remember缓存：**
+   ```kotlin
+   // ❌ 每次Recompose都创建新协程
+   LaunchedEffect(Unit) {
+       animatable.animateTo(1f)
+   }
+   
+   // ✅ 使用remember避免重复创建
+   val animatable = remember { Animatable(0f) }
+   LaunchedEffect(target) {
+       animatable.animateTo(target)
+   }
+   ```
+
+3. **及时取消不再需要的动画：**
+   ```kotlin
+   // 使用key参数自动取消
+   LaunchedEffect(currentPage) {
+       pageAnimatable.animateTo(currentPage * 1f)
+   }
+   ```
 
 **LaunchedEffect在动画中的作用：**
 
